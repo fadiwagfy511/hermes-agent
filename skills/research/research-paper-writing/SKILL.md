@@ -2303,24 +2303,7 @@ Use `clarify` for targeted questions when genuinely blocked:
 
 ## Reviewer Evaluation Criteria
 
-Understanding what reviewers look for helps focus effort:
-
-| Criterion | What They Check |
-|-----------|----------------|
-| **Quality** | Technical soundness, well-supported claims, fair baselines |
-| **Clarity** | Clear writing, reproducible by experts, consistent notation |
-| **Significance** | Community impact, advances understanding |
-| **Originality** | New insights (doesn't require new method) |
-
-**Scoring (NeurIPS 6-point scale):**
-- 6: Strong Accept — groundbreaking, flawless
-- 5: Accept — technically solid, high impact
-- 4: Borderline Accept — solid, limited evaluation
-- 3: Borderline Reject — weaknesses outweigh
-- 2: Reject — technical flaws
-- 1: Strong Reject — known results or ethics issues
-
-See [references/reviewer-guidelines.md](references/reviewer-guidelines.md) for detailed guidelines, common concerns, and rebuttal strategies.
+Understanding what reviewers look for helps focus effort. See [references/reviewer-guidelines.md](references/reviewer-guidelines.md) for detailed evaluation criteria (Quality, Clarity, Significance, Originality), the NeurIPS 6-point scoring scale, common concerns, and rebuttal strategies.
 
 ---
 
@@ -2345,17 +2328,7 @@ See [references/reviewer-guidelines.md](references/reviewer-guidelines.md) for d
 
 ## Reference Documents
 
-| Document | Contents |
-|----------|----------|
-| [references/writing-guide.md](references/writing-guide.md) | Gopen & Swan 7 principles, Perez micro-tips, Lipton word choice, Steinhardt precision, figure design |
-| [references/citation-workflow.md](references/citation-workflow.md) | Citation APIs, Python code, CitationManager class, BibTeX management |
-| [references/checklists.md](references/checklists.md) | NeurIPS 16-item, ICML, ICLR, ACL requirements, universal pre-submission checklist |
-| [references/reviewer-guidelines.md](references/reviewer-guidelines.md) | Evaluation criteria, scoring, common concerns, rebuttal template |
-| [references/sources.md](references/sources.md) | Complete bibliography of all writing guides, conference guidelines, APIs |
-| [references/experiment-patterns.md](references/experiment-patterns.md) | Experiment design patterns, evaluation protocols, monitoring, error recovery |
-| [references/autoreason-methodology.md](references/autoreason-methodology.md) | Autoreason loop, strategy selection, model guide, prompts, scope constraints, Borda scoring |
-| [references/human-evaluation.md](references/human-evaluation.md) | Human evaluation design, annotation guidelines, agreement metrics, crowdsourcing QC, IRB guidance |
-| [references/paper-types.md](references/paper-types.md) | Theory papers (proof writing, theorem structure), survey papers, benchmark papers, position papers |
+Find all reference docs under `references/` in this skill directory — writing guides, citation workflows, checklists, reviewer guidelines, experiment patterns, autoreason methodology, human evaluation, paper types, and sources.
 
 ### LaTeX Templates
 
@@ -2365,13 +2338,4 @@ See [templates/README.md](templates/README.md) for compilation instructions.
 
 ### Key External Sources
 
-**Writing Philosophy:**
-- [Neel Nanda: How to Write ML Papers](https://www.alignmentforum.org/posts/eJGptPbbFPZGLpjsp/highly-opinionated-advice-on-how-to-write-ml-papers)
-- [Sebastian Farquhar: How to Write ML Papers](https://sebastianfarquhar.com/on-research/2024/11/04/how_to_write_ml_papers/)
-- [Gopen & Swan: Science of Scientific Writing](https://cseweb.ucsd.edu/~swanson/papers/science-of-writing.pdf)
-- [Lipton: Heuristics for Scientific Writing](https://www.approximatelycorrect.com/2018/01/29/heuristics-technical-scientific-writing-machine-learning-perspective/)
-- [Perez: Easy Paper Writing Tips](https://ethanperez.net/easy-paper-writing-tips/)
-
-**APIs:** [Semantic Scholar](https://api.semanticscholar.org/api-docs/) | [CrossRef](https://www.crossref.org/documentation/retrieve-metadata/rest-api/) | [arXiv](https://info.arxiv.org/help/api/basics.html)
-
-**Venues:** [NeurIPS](https://neurips.cc/Conferences/2025/PaperInformation/StyleFiles) | [ICML](https://icml.cc/Conferences/2025/AuthorInstructions) | [ICLR](https://iclr.cc/Conferences/2026/AuthorGuide) | [ACL](https://github.com/acl-org/acl-style-files)
+See [references/sources.md](references/sources.md) for all writing guides, conference guidelines, and API docs.
