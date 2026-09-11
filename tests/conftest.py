@@ -907,3 +907,25 @@ def _elite_projection_offline(monkeypatch):
         return
     monkeypatch.setattr(_ch, "_elite_guard_outbound",
                         lambda agent, api_kwargs: api_kwargs, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _elite_aux_egress_offline(monkeypatch):
+    """Neutralise the Elite auxiliary egress lockdown during tests.
+
+    `agent.aux_egress_policy` refuses any auxiliary client aimed at an endpoint
+    that is not the sanctioned Elite gateway or a configured local route. The
+    existing auxiliary tests deliberately construct clients for OpenAI,
+    Anthropic, OpenRouter, Bedrock and friends, so without this they raise
+    AuxEgressBlocked.
+
+    Patched in-process and only for tests. Production enforcement is
+    unconditional: there is deliberately no config key and no environment
+    variable that disables it, because a kill switch reachable from ambient
+    process state is exactly what this module exists to distrust.
+    """
+    try:
+        from agent import aux_egress_policy as _egress
+    except Exception:
+        return
+    monkeypatch.setattr(_egress, "_ENFORCE", False, raising=False)

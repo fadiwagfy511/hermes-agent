@@ -172,7 +172,70 @@ def _openai_http_client_kwargs(
     return {"http_client": client}
 
 
+def _aux_egress_refused_type():
+    """The policy exception, imported lazily so a missing module is not fatal."""
+    try:
+        from agent.aux_egress_policy import AuxEgressBlocked
+        return AuxEgressBlocked
+    except Exception:  # pragma: no cover
+        return ()
+
+
+_AuxEgressRefused = _aux_egress_refused_type()
+
+
+def _effective_provider_base_url(pconfig: Any) -> str:
+    """The URL a provider will actually be built with.
+
+    The registry default is not it: a provider legitimately re-pointed at an
+    approved local route via its documented ``*_BASE_URL`` env var was being
+    refused on a URL it no longer uses. credential_pool._provider_seed_allowed
+    already reads the override first; these gates did not.
+    """
+    try:
+        env_var = getattr(pconfig, "base_url_env_var", "") or ""
+        if env_var:
+            from agent.credential_pool import load_env
+            val = ((load_env() or {}).get(env_var) or os.environ.get(env_var) or "")
+            val = str(val).strip().rstrip("/")
+            if val:
+                return val
+    except Exception:
+        pass
+    return str(getattr(pconfig, "inference_base_url", "") or "")
+
+
+def _gated_client(base_url: Any, where: str) -> str:
+    """Elite auxiliary egress policy (JOB D) — the single gate.
+
+    EVERY auxiliary client construction must call this immediately before
+    building the client, whatever SDK it uses. The first cut of this lockdown
+    gated only ``_create_openai_client``, which left the Gemini native, Anthropic
+    (``api_mode: anthropic_messages``), Bedrock and Copilot-ACP constructors
+    returning fully usable public-provider clients. Routing through one helper
+    means a new SDK path cannot be added without passing the gate.
+    """
+    from agent import aux_egress_policy as _egress
+    return _egress.assert_allowed(str(base_url or ""), where)
+
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # Single construction choke point for every OpenAI-compatible auxiliary
+    # client — the aggregator chain, custom endpoints and the ambient
+    # credential path all arrive here. An endpoint that is neither the
+    # sanctioned Elite gateway nor a configured local route raises rather than
+    # returning a usable client, so no auxiliary code can open a direct line to
+    # a public provider.
+    from agent import aux_egress_policy as _egress
+    _verdict = _gated_client(base_url, "auxiliary_client._create_openai_client")
+    if _verdict == _egress.GATEWAY:
+        # Authenticate to the gateway. An unauthenticated auxiliary request
+        # 401s, and call_llm treats a 401 as a fallback-worthy error — which is
+        # how the bypass was reachable without anything being misconfigured.
+        _gw_key = _egress.gateway_credential()
+        if _gw_key:
+            api_key = _gw_key
+
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     # Hermes owns auxiliary retry + provider/model fallback policy (the
     # same-provider transient retry in call_llm plus the except-chain
@@ -1409,6 +1472,10 @@ def _maybe_wrap_anthropic(
         )
         return client_obj
 
+    # Gate BEFORE the try. Inside it, the `except Exception` below would swallow
+    # a policy refusal into a "falling back to OpenAI-wire client" warning —
+    # which is both a false log and a silent downgrade of a policy decision.
+    _gated_client(base_url, "auxiliary_client.anthropic_client")
     try:
         real_client = build_anthropic_client(api_key, base_url)
     except Exception as exc:
@@ -1685,6 +1752,16 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
+        # Skip providers the egress policy refuses, so an early public entry in
+        # registry order cannot deny a later approved one (LM Studio).
+        try:
+            from agent import aux_egress_policy as _egress
+            _eff = _effective_provider_base_url(pconfig)
+            if _egress.enabled() and _eff:
+                if _egress.classify(_eff)[0] == _egress.FORBIDDEN:
+                    continue
+        except Exception:
+            continue
         if _is_provider_unhealthy(provider_id):
             logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
             continue
@@ -1716,6 +1793,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
                 if is_native_gemini_base_url(base_url):
+                    _gated_client(base_url, "auxiliary_client.gemini_native")
                     return GeminiNativeClient(api_key=api_key, base_url=base_url), model
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
@@ -1756,6 +1834,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
+                _gated_client(base_url, "auxiliary_client.gemini_native")
                 return GeminiNativeClient(api_key=api_key, base_url=base_url), model
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
@@ -2184,6 +2263,7 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         # Anthropic OAuth claims only apply to api.anthropic.com.
         try:
             from agent.anthropic_adapter import build_anthropic_client
+            _gated_client(custom_base, "auxiliary_client.custom_anthropic")
             real_client = build_anthropic_client(custom_key, custom_base)
         except ImportError:
             logger.warning(
@@ -2215,6 +2295,16 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     would silently rot when xAI's allowlist drifts.  Returns ``(None, None)``
     when the user has not authenticated with xAI Grok OAuth.
     """
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # The sanctioned gateway is OpenAI-compatible, so this builder can only
+    # ever produce a direct-provider client. Under lockdown it resolves to
+    # nothing instead.
+    try:
+        from agent import aux_egress_policy as _egress
+        if _egress.enabled():
+            return None, None
+    except Exception:
+        return None, None
     if not model:
         logger.warning(
             "Auxiliary client: xai-oauth requested without a model; "
@@ -2241,6 +2331,16 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
 
     Returns (None, None) when no Codex OAuth token is available.
     """
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # The sanctioned gateway is OpenAI-compatible, so this builder can only
+    # ever produce a direct-provider client. Under lockdown it resolves to
+    # nothing instead.
+    try:
+        from agent import aux_egress_policy as _egress
+        if _egress.enabled():
+            return None, None
+    except Exception:
+        return None, None
     if not model:
         logger.warning(
             "Auxiliary client: openai-codex requested without a model; "
@@ -2386,6 +2486,16 @@ def _try_azure_foundry(
 
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # The sanctioned gateway is OpenAI-compatible, so this builder can only
+    # ever produce a direct-provider client. Under lockdown it resolves to
+    # nothing instead.
+    try:
+        from agent import aux_egress_policy as _egress
+        if _egress.enabled():
+            return None, None
+    except Exception:
+        return None, None
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -2431,6 +2541,7 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
+        _gated_client(base_url, "auxiliary_client.anthropic_token")
         real_client = build_anthropic_client(token, base_url)
     except ImportError:
         # The anthropic_adapter module imports fine but the SDK itself is
@@ -2489,12 +2600,21 @@ def _get_provider_chain() -> List[tuple]:
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
     """
-    return [
+    chain = [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
     ]
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # The ``api-key`` step walks PROVIDER_REGISTRY and returns the first
+    # provider holding a usable credential. Under lockdown it must not elect a
+    # PUBLIC provider — but it is also the ONLY way LM Studio
+    # (127.0.0.1:1234), an approved local route, is discovered. Removing the
+    # step therefore starved a legitimate local backend. The step stays; each
+    # candidate inside it is refused individually by the gate at construction,
+    # and the loop skips refused providers rather than aborting.
+    return chain
 
 
 # ── Auxiliary "recently 402'd" unhealthy-provider cache ────────────────────
@@ -3360,7 +3480,13 @@ def _try_payment_fallback(
             _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
-        client, model = try_fn()
+        try:
+            client, model = try_fn()
+        except _AuxEgressRefused:
+            # This provider is not an approved egress target. Skip it
+            # and keep walking the chain — aborting here would deny the
+            # approved local route further down the list.
+            client, model = None, None
         if client is not None:
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -3851,13 +3977,20 @@ def _resolve_auto(
         if main_chain_label and _is_provider_unhealthy(main_chain_label):
             _log_skip_unhealthy(main_chain_label)
         else:
-            client, resolved = resolve_provider_client(
-                resolved_provider,
-                main_model,
-                explicit_base_url=explicit_base_url,
-                explicit_api_key=explicit_api_key,
-                api_mode=runtime_api_mode or None,
-            )
+            try:
+                client, resolved = resolve_provider_client(
+                    resolved_provider,
+                    main_model,
+                    explicit_base_url=explicit_base_url,
+                    explicit_api_key=explicit_api_key,
+                    api_mode=runtime_api_mode or None,
+                )
+            except _AuxEgressRefused:
+                # The main provider is not an approved egress target. That is a
+                # reason to fall through to Steps 2/3 (configured fallbacks,
+                # LiteLLM, LM Studio, the gateway) — NOT to abort the whole auto
+                # chain, which is the default route for every auxiliary task.
+                client, resolved = None, None
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
@@ -3885,7 +4018,13 @@ def _resolve_auto(
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
             continue
-        client, model = try_fn()
+        try:
+            client, model = try_fn()
+        except _AuxEgressRefused:
+            # This provider is not an approved egress target. Skip it
+            # and keep walking the chain — aborting here would deny the
+            # approved local route further down the list.
+            client, model = None, None
         if client is not None:
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
@@ -3920,6 +4059,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     header so the request is routed to Copilot's vision-capable
     infrastructure (otherwise vision payloads silently time out).
     """
+    # Gate FIRST: the Codex / Anthropic / Gemini wrappers below return
+    # early, so a gate placed lower only ever sees plain AsyncOpenAI.
+    # Read the URL off the client here — `sync_base_url` is assigned further
+    # down, which made it a function-local and turned this gate into an
+    # UnboundLocalError on every async call, approved targets included.
+    _gated_client(getattr(sync_client, "base_url", ""),
+                  "auxiliary_client._to_async_client")
     from openai import AsyncOpenAI
 
     if isinstance(sync_client, CodexAuxiliaryClient):
@@ -4278,19 +4424,27 @@ def resolve_provider_client(
                     else (client, final_model))
         # Try custom first, then API-key providers (Codex excluded here:
         # falling through to Codex with no model is a stale-constant trap).
+        # Both steps are gated per-provider inside; a refusal skips that
+        # provider rather than denying the whole resolution.
         for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
-            client, default = try_fn()
-            if client is not None:
-                final_model = _normalize_resolved_model(model or default, provider)
-                _cbase = str(getattr(client, "base_url", "") or "")
-                # ``client.api_key`` may be a callable (Azure Foundry Entra
-                # bearer provider). Pass empty string for the wrapper-detection
-                # path — wrapping decisions are based on base_url + api_mode.
-                _raw_ckey = getattr(client, "api_key", "")
-                _ckey = "" if (callable(_raw_ckey) and not isinstance(_raw_ckey, str)) else str(_raw_ckey or "")
-                client = _wrap_if_needed(client, final_model, _cbase, _ckey)
-                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
-                        else (client, final_model))
+            try:
+                client, default = try_fn()
+                if client is not None:
+                    final_model = _normalize_resolved_model(model or default, provider)
+                    _cbase = str(getattr(client, "base_url", "") or "")
+                    # ``client.api_key`` may be a callable (Azure Foundry Entra
+                    # bearer provider). Pass empty string for the wrapper-detection
+                    # path — wrapping decisions are based on base_url + api_mode.
+                    _raw_ckey = getattr(client, "api_key", "")
+                    _ckey = "" if (callable(_raw_ckey) and not isinstance(_raw_ckey, str)) else str(_raw_ckey or "")
+                    client = _wrap_if_needed(client, final_model, _cbase, _ckey)
+                    return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                            else (client, final_model))
+            except _AuxEgressRefused:
+                # A refused step must not deny the step below it —
+                # _resolve_api_key_provider is the only LM Studio
+                # discovery path in this branch.
+                continue
         logger.warning("resolve_provider_client: custom/main requested "
                        "but no endpoint credentials found")
         return None, None
@@ -4360,6 +4514,7 @@ def resolve_provider_client(
                 if entry_api_mode == "anthropic_messages":
                     try:
                         from agent.anthropic_adapter import build_anthropic_client
+                        _gated_client(custom_base, "auxiliary_client.named_anthropic")
                         real_client = build_anthropic_client(custom_key, custom_base)
                     except ImportError:
                         logger.warning(
@@ -4460,6 +4615,16 @@ def resolve_provider_client(
         return None, None
 
     if pconfig.auth_type == "api_key":
+        # ── Elite auxiliary egress policy (JOB D) ────────────────────────
+        # Classify BEFORE resolving credentials. resolve_api_key_provider_
+        # credentials() performs live endpoint-detection for some providers —
+        # notably it POSTs the API KEY to api.z.ai and open.bigmodel.cn, and the
+        # Copilot path exchanges a token with api.github.com. Refusing after
+        # that point still blocks the request but has already leaked the
+        # credential, so the check has to come first.
+        _gated_client(_effective_provider_base_url(pconfig),
+                      "auxiliary_client.resolve_provider_client")
+
         if provider == "anthropic":
             client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
             if client is None:
@@ -4500,6 +4665,7 @@ def resolve_provider_client(
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
+                _gated_client(base_url, "auxiliary_client.gemini_native")
                 client = GeminiNativeClient(api_key=api_key, base_url=base_url)
                 logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
                 return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -4589,6 +4755,7 @@ def resolve_provider_client(
                 return None, None
             from agent.copilot_acp_client import CopilotACPClient
 
+            _gated_client(base_url, "auxiliary_client.copilot_acp")
             client = CopilotACPClient(
                 api_key=api_key,
                 base_url=base_url,
@@ -4627,6 +4794,9 @@ def resolve_provider_client(
                            "could not mint token / resolve project")
             return None, None
 
+        # Gated outside the try below, which swallows exceptions into a
+        # warning — a refusal must propagate, not become a silent (None, None).
+        _gated_client(base_url, "auxiliary_client.vertex")
         default_model = "google/gemini-3-flash-preview"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
@@ -4660,6 +4830,10 @@ def resolve_provider_client(
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
+            # Bedrock needs no API key: ambient AWS credentials resolve it,
+            # so it must be classified like any other egress target.
+            _gated_client(f"https://bedrock-runtime.{region}.amazonaws.com",
+                          "auxiliary_client.bedrock")
             real_client = build_anthropic_bedrock_client(region)
         except ImportError as exc:
             logger.warning("resolve_provider_client: cannot create Bedrock "
@@ -4824,16 +4998,27 @@ def get_available_vision_backends() -> List[str]:
     # 1. Active provider — if the user configured a provider, try it first.
     main_provider = _read_main_provider()
     if main_provider and main_provider not in {"auto", ""}:
-        if main_provider in _VISION_AUTO_PROVIDER_ORDER:
-            if _strict_vision_backend_available(main_provider):
-                available.append(main_provider)
-        else:
-            client, _ = resolve_provider_client(main_provider, _read_main_model())
-            if client is not None:
-                available.append(main_provider)
+        # A main provider the policy refuses is simply not an available backend.
+        # This has to be caught HERE as well as in the fallback loop below —
+        # this branch runs first, so an unguarded refusal here would abort the
+        # whole function and the fallback loop would never execute.
+        try:
+            if main_provider in _VISION_AUTO_PROVIDER_ORDER:
+                if _strict_vision_backend_available(main_provider):
+                    available.append(main_provider)
+            else:
+                client, _ = resolve_provider_client(main_provider, _read_main_model())
+                if client is not None:
+                    available.append(main_provider)
+        except _AuxEgressRefused:
+            pass
     # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
     for p in _VISION_AUTO_PROVIDER_ORDER:
-        if p not in available and _strict_vision_backend_available(p):
+        try:
+            _ok = p not in available and _strict_vision_backend_available(p)
+        except _AuxEgressRefused:
+            _ok = False          # a refused backend is simply not available
+        if _ok:
             available.append(p)
     return available
 
@@ -4871,14 +5056,19 @@ def resolve_vision_provider_client(
         provider_for_base_override = (
             requested if requested and requested not in {"", "auto"} else "custom"
         )
-        client, final_model = resolve_provider_client(
-            provider_for_base_override,
-            model=resolved_model,
-            async_mode=async_mode,
-            explicit_base_url=resolved_base_url,
-            explicit_api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-        )
+        # An explicit base_url that the policy refuses must degrade to "no
+        # vision backend" like every other route here, not raise into the tool.
+        try:
+            client, final_model = resolve_provider_client(
+                provider_for_base_override,
+                model=resolved_model,
+                async_mode=async_mode,
+                explicit_base_url=resolved_base_url,
+                explicit_api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+            )
+        except _AuxEgressRefused:
+            client, final_model = None, None
         if client is None:
             return provider_for_base_override, None, None
         return provider_for_base_override, client, final_model
@@ -4900,9 +5090,14 @@ def resolve_vision_provider_client(
         if main_provider and main_provider not in {"auto", ""}:
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
-                sync_client, default_model = _resolve_strict_vision_backend(
+                try:
+                    sync_client, default_model = _resolve_strict_vision_backend(
                     main_provider, vision_model
-                )
+                    )
+                except _AuxEgressRefused:
+                    # Runs BEFORE the wrapped sibling below, so an
+                    # un-wrapped refusal here denies vision entirely.
+                    sync_client, default_model = None, None
                 if sync_client is not None:
                     logger.info(
                         "Vision auto-detect: using main provider %s (%s)",
@@ -4940,10 +5135,16 @@ def resolve_vision_provider_client(
                     main_provider,
                 )
             else:
-                rpc_client, rpc_model = resolve_provider_client(
-                    main_provider, vision_model,
-                    api_mode=resolved_api_mode,
-                    is_vision=True)
+                # Same reasoning as get_available_vision_backends: this runs
+                # before the aggregator loop, so a refusal here must degrade to
+                # "no client from the main provider" rather than abort vision.
+                try:
+                    rpc_client, rpc_model = resolve_provider_client(
+                        main_provider, vision_model,
+                        api_mode=resolved_api_mode,
+                        is_vision=True)
+                except _AuxEgressRefused:
+                    rpc_client, rpc_model = None, None
                 if rpc_client is not None:
                     logger.info(
                         "Vision auto-detect: using main provider %s (%s)",
@@ -4957,7 +5158,13 @@ def resolve_vision_provider_client(
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
             if candidate == main_provider:
                 continue  # already tried above
-            sync_client, default_model = _resolve_strict_vision_backend(candidate)
+            try:
+                sync_client, default_model = _resolve_strict_vision_backend(candidate)
+            except _AuxEgressRefused:
+                # Not an approved egress target — skip it and keep walking the
+                # order, exactly as the text chains do. Aborting here would
+                # deny vision even when an approved backend follows.
+                continue
             if sync_client is not None:
                 return _finalize(candidate, sync_client, default_model)
 
@@ -4965,9 +5172,14 @@ def resolve_vision_provider_client(
         return None, None, None
 
     if requested in _VISION_AUTO_PROVIDER_ORDER:
-        sync_client, default_model = _resolve_strict_vision_backend(
-            requested, resolved_model
-        )
+        try:
+            sync_client, default_model = _resolve_strict_vision_backend(
+                requested, resolved_model
+            )
+        except _AuxEgressRefused:
+            # Degrade to "no vision backend" so call_llm's vision branch can
+            # fall back to the auto backends, rather than escaping to the tool.
+            sync_client, default_model = None, None
         return _finalize(requested, sync_client, default_model)
 
     # ZAI vision models must use the OpenAI-compatible endpoint, not the
@@ -4980,26 +5192,38 @@ def resolve_vision_provider_client(
             "https://api.z.ai/api/paas/v4",
         ]
         for _zai_url in zai_openai_urls:
-            client, final_model = _get_cached_client(
-                requested, resolved_model, async_mode,
-                base_url=_zai_url,
-                api_key=resolved_api_key or None,
-                api_mode="chat_completions",
-                is_vision=True,
-            )
+            try:
+                client, final_model = _get_cached_client(
+                    requested, resolved_model, async_mode,
+                    base_url=_zai_url,
+                    api_key=resolved_api_key or None,
+                    api_mode="chat_completions",
+                    is_vision=True,
+                )
+            except _AuxEgressRefused:
+                continue
             if client is not None:
                 return _finalize(requested, client, final_model)
         # Fallback: try without explicit base_url (old behavior)
-        client, final_model = _get_cached_client(requested, resolved_model, async_mode,
-                                                 api_mode=resolved_api_mode,
-                                                 is_vision=True)
+        try:
+            client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                                     api_mode=resolved_api_mode,
+                                                     is_vision=True)
+        except _AuxEgressRefused:
+            client = None
         if client is None:
             return requested, None, None
         return requested, client, final_model
 
-    client, final_model = _get_cached_client(requested, resolved_model, async_mode,
-                                             api_mode=resolved_api_mode,
-                                             is_vision=True)
+    # Every explicit vision provider degrades to "no backend" rather than
+    # raising into the tool — the guard previously covered only the two
+    # providers in _VISION_AUTO_PROVIDER_ORDER.
+    try:
+        client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                                 api_mode=resolved_api_mode,
+                                                 is_vision=True)
+    except _AuxEgressRefused:
+        client = None
     if client is None:
         return requested, None, None
     return requested, client, final_model
@@ -5976,14 +6200,20 @@ def call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-            main_runtime=main_runtime,
-        )
+        try:
+            client, final_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+            )
+        except _AuxEgressRefused:
+            # Treat a refused provider as "no client available" so the
+            # unavailable-client fallback and the auto chain below still run,
+            # rather than surfacing the refusal to the auxiliary task's caller.
+            client, final_model = None, None
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
@@ -6573,14 +6803,20 @@ async def async_call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            async_mode=True,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-        )
+        try:
+            client, final_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                async_mode=True,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+            )
+        except _AuxEgressRefused:
+            # Mirror the sync path exactly: a refused provider is "no client",
+            # so the unavailable-client fallback and auto chain below still run
+            # instead of the refusal escaping to the auxiliary task's caller.
+            client, final_model = None, None
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:

@@ -76,6 +76,32 @@ def probe_gemini_tier(
     - ``"paid"``    -- key is on a paid tier
     - ``"unknown"`` -- probe failed; callers should proceed without blocking.
     """
+    # Elite auxiliary egress policy (JOB D): this helper POSTs to
+    # :generateContent through its own httpx client, bypassing the auxiliary
+    # client factories entirely, so it needs its own gate.
+    try:
+        from agent import aux_egress_policy as _egress
+        _egress.assert_allowed(base_url, "gemini_native_adapter.probe_gemini_tier")
+    except Exception:
+        # FAIL CLOSED. Only a positive decision from the policy lets the probe
+        # reach the network: a refusal, an error inside the check, a partial or
+        # broken module, and the module being absent or unimportable are all the
+        # same answer here — no approval was obtained, so no request is sent.
+        #
+        # An earlier cut handled ImportError separately with `pass`, on the
+        # reasoning that a missing policy module is an install problem rather
+        # than a routing decision. That inverted the invariant: the one state in
+        # which the lockdown cannot speak was the one state in which this helper
+        # POSTed the key and prompt straight to generativelanguage.googleapis.com.
+        #
+        # Reporting rather than raising is deliberate and unchanged: "unknown"
+        # is this function's documented "probe failed, proceed without blocking"
+        # value, and its sole caller (hermes_cli/model_setup_flows.py) has no
+        # handler, so raising turned `hermes setup` / `hermes model` into an
+        # unhandled traceback. "unknown" is a report, not a fallback — no
+        # alternate provider, credential or direct call follows from it.
+        return "unknown"
+
     key = (api_key or "").strip()
     if not key:
         return "unknown"

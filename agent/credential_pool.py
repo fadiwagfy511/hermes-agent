@@ -1767,9 +1767,102 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
+def _provider_seed_allowed(provider: str) -> bool:
+    """Elite auxiliary egress policy (JOB D) — may this provider be seeded?
+
+    Classifies the URL the pool entry will ACTUALLY carry, not the registry
+    default: the effective endpoint comes from the provider's base_url env var,
+    which is read further down, so gating on the registry value alone both
+    missed overrides and wrongly refused a provider legitimately pointed at a
+    local route.
+
+    Providers absent from PROVIDER_REGISTRY are handled explicitly: openrouter
+    is not registered, so a registry lookup returned "" and the gate silently
+    no-opped for it. (nous IS registered — the original rationale named it in
+    error, though both are correctly refused.)
+    """
+    try:
+        from agent import aux_egress_policy as _egress
+    except Exception:
+        return False                      # no policy -> do not seed
+
+    # Providers deliberately absent from PROVIDER_REGISTRY still have a known
+    # public endpoint; naming them here is what stops the registry miss from
+    # failing OPEN for exactly the most prominent providers.
+    # Only providers genuinely ABSENT from PROVIDER_REGISTRY need naming here;
+    # a registered one is resolved from its own config above, so listing it
+    # would be unreachable. openrouter and openai are the absent ones.
+    known_public = {
+        "openrouter": "https://openrouter.ai/api/v1",
+        "openai": "https://api.openai.com/v1",
+    }
+    # Unregistered providers whose endpoint is named per-entry rather than by a
+    # registry default. Their URL is classified at client construction, so
+    # seeding a credential for them is not itself an egress decision.
+    per_entry = {"custom", "litellm", "ollama", "lmstudio", "local"}
+    def _env_url(key: str) -> str:
+        """Read a base-URL override the way the seeders do.
+
+        NOTE: `_get_env_prefer_dotenv` is a closure local inside
+        `_seed_from_env`, not a module-level name — calling it from here raised
+        NameError into a swallowing `except`, which made the override read below
+        dead code in both directions.
+        """
+        if not key:
+            return ""
+        try:
+            val = (load_env() or {}).get(key) or ""
+        except Exception:
+            val = ""
+        if not val:
+            try:
+                val = _get_secret(key, "") or ""
+            except Exception:
+                val = ""
+        return str(val).strip().rstrip("/")
+
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    url = ""
+    if pconfig is not None:
+        url = _env_url(getattr(pconfig, "base_url_env_var", ""))
+        url = url or getattr(pconfig, "inference_base_url", "") or ""
+        if not url:
+            # A registered provider with no resolvable endpoint (azure-foundry)
+            # cannot be shown to be approved, so it is not seeded.
+            return False
+    elif provider in known_public:
+        url = known_public[provider]
+    elif provider in per_entry or provider.startswith("custom:"):
+        # Exact names, or the "custom:<name>" form Hermes actually uses. A bare
+        # startswith("custom") also admitted custom-evil / customopenai.
+        return True
+    else:
+        # Unknown and unregistered: refuse rather than guess. Failing closed
+        # here costs at most an unavailable provider; failing open costs egress.
+        return False
+
+    if not url:
+        return True                        # nothing to classify
+    return _egress.classify(url)[0] != _egress.FORBIDDEN
+
+
 def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # Same rule as _seed_from_env, applied here too: seeding a provider whose
+    # inference endpoint is not an approved egress target is refused. This
+    # seeder is the one that performs a live GitHub token exchange for Copilot
+    # (copilot_auth.exchange_copilot_token -> api.github.com), sending a GitHub
+    # credential to a public host purely to discover a provider the auxiliary
+    # stack is no longer allowed to use.
+    try:
+        from agent import aux_egress_policy as _egress
+        if _egress.enabled() and not _provider_seed_allowed(provider):
+            return changed, active_sources
+    except Exception:
+        # Policy module unavailable: refuse to seed rather than seed blindly.
+        return changed, active_sources
     auth_store = _load_auth_store()
 
     # Shared suppression gate — used at every upsert site so
@@ -2096,6 +2189,21 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     changed = False
     active_sources: Set[str] = set()
 
+    # ── Elite auxiliary egress policy (JOB D) ────────────────────────────
+    # Placed at the very top, above every provider-specific branch: the
+    # openrouter branch (and any other early return) would otherwise seed
+    # before a lower check ran. Seeding from an ambient credential is what
+    # makes a public provider reachable at all, and for some providers the
+    # seed itself probes that provider's endpoint WITH the key attached.
+    try:
+        from agent import aux_egress_policy as _egress
+        if _egress.enabled() and not _provider_seed_allowed(provider):
+            return changed, active_sources
+    except Exception:
+        # Policy module unavailable: refuse to seed direct-provider
+        # credentials rather than fall back to seeding them.
+        return changed, active_sources
+
     # Prefer ~/.hermes/.env over os.environ — the user's config file is the
     # authoritative source for Hermes credentials. Stale env vars from parent
     # processes (Codex CLI, test scripts, etc.) should not override deliberate
@@ -2251,10 +2359,66 @@ def _prune_stale_seeded_entries(
     return True
 
 
+def _custom_pool_base_url(pool_key: str) -> str:
+    """The base_url a custom pool entry will actually carry, or "" if unknown.
+
+    Uses the existing exact-match resolver rather than a second, looser one: an
+    earlier version matched with ``pool_key.endswith(name)``, which lets
+    ``custom:evil-foo`` pick up the URL of a spec named ``foo`` and be
+    classified on the wrong entry.
+
+    It also consults the model-level custom endpoint, because ``_seed_custom_pool``
+    seeds from BOTH ``custom_providers`` and ``model.provider == "custom"`` +
+    ``model.base_url``; reading only the former silently starved a user whose
+    approved local route is configured the second way.
+    """
+    try:
+        spec = _get_custom_provider_config(pool_key)
+        if isinstance(spec, dict):
+            url = str(spec.get("base_url") or spec.get("api_base") or "")
+            if url:
+                return url
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+        model_cfg = (load_config() or {}).get("model") or {}
+        if isinstance(model_cfg, dict):
+            prov = str(model_cfg.get("provider") or "")
+            if prov == "custom" or prov.startswith("custom:"):
+                return str(model_cfg.get("base_url") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _custom_entry_allowed(base_url: str) -> bool:
+    """Elite auxiliary egress policy (JOB D) — custom pool entries.
+
+    A custom_providers entry names its own base_url, so it is classified
+    directly rather than through PROVIDER_REGISTRY.
+    """
+    try:
+        from agent import aux_egress_policy as _egress
+        if not _egress.enabled():
+            return True
+        return _egress.classify(base_url or "")[0] != _egress.FORBIDDEN
+    except Exception:
+        return False
+
+
 def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     """Seed a custom endpoint pool from custom_providers config and model config."""
+    # Elite auxiliary egress policy (JOB D): a custom pool entry names its own
+    # base_url, so classify that directly rather than a registry default.
     changed = False
     active_sources: Set[str] = set()
+    _cp_url = _custom_pool_base_url(pool_key)
+    # An unknown URL is left to the construction-time gate, matching
+    # _provider_seed_allowed's "nothing to classify" branch. Blocking here
+    # instead would starve an approved route whose URL this cannot resolve.
+    if _cp_url and not _custom_entry_allowed(_cp_url):
+        return changed, active_sources
 
     # Shared suppression gate — same pattern as _seed_from_env/_seed_from_singletons.
     try:

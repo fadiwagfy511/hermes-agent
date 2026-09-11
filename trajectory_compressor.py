@@ -399,8 +399,13 @@ class TrajectoryCompressor:
                     f"environment variable.")
             from openai import OpenAI
             from agent.auxiliary_client import _to_openai_base_url
-            self.client = OpenAI(
-                api_key=api_key, base_url=_to_openai_base_url(self.config.base_url))
+            _tc_base = _to_openai_base_url(self.config.base_url)
+            # Elite auxiliary egress policy (JOB D): this path builds its own
+            # client straight from config + an environment key, bypassing the
+            # auxiliary_client choke point entirely.
+            from agent import aux_egress_policy as _egress
+            _egress.assert_allowed(_tc_base, "trajectory_compressor.custom_endpoint")
+            self.client = OpenAI(api_key=api_key, base_url=_tc_base)
             # AsyncOpenAI is created lazily in _get_async_client() so it
             # binds to the current event loop — avoids "Event loop is closed"
             # when process_directory() is called multiple times (each call
@@ -421,6 +426,10 @@ class TrajectoryCompressor:
         from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
         # Always create a fresh client so it binds to the running loop.
+        from agent import aux_egress_policy as _egress
+        _egress.assert_allowed(
+            _to_openai_base_url(self.config.base_url),
+            "trajectory_compressor.async_client")
         self.async_client = AsyncOpenAI(
             api_key=self._async_client_api_key,
             base_url=_to_openai_base_url(self.config.base_url),

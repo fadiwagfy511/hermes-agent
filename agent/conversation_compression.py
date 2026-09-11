@@ -186,10 +186,19 @@ def check_compression_model_feasibility(agent: Any) -> None:
             _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
         except Exception:
             _aux_cfg_provider = ""
-        client, aux_model = get_text_auxiliary_client(
-            "compression",
-            main_runtime=agent._current_main_runtime(),
-        )
+        try:
+            client, aux_model = get_text_auxiliary_client(
+                "compression",
+                main_runtime=agent._current_main_runtime(),
+            )
+        except Exception as _aux_exc:
+            # A policy refusal must degrade to "no auxiliary client" here. The
+            # enclosing handler catches only ValueError, so an AuxEgressBlocked
+            # would otherwise propagate out of compression into the agent turn
+            # loop instead of falling through to the configured fallback below.
+            logger.debug("auxiliary client unavailable for compression: %s",
+                         type(_aux_exc).__name__)
+            client, aux_model = None, None
         if client is None or not aux_model:
             fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                 "compression",
