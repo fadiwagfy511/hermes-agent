@@ -884,3 +884,26 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _elite_projection_offline(monkeypatch):
+    """Neutralise the Elite protected-project projection layer during tests.
+
+    ``agent.external_projection`` fails CLOSED when the root-owned policy engine
+    at /Library/Application Support/EliteProtected/ is absent or not root-owned,
+    which is correct in production but would make every test that drives
+    ``interruptible_api_call`` / ``interruptible_streaming_api_call`` with an
+    external provider refuse on CI and on any machine without that policy
+    installed.
+
+    Patched in-process and only for tests. The production code deliberately has
+    no environment-variable escape: an env override would let any process
+    replace the policy engine with a permissive stub.
+    """
+    try:
+        from agent import chat_completion_helpers as _ch
+    except Exception:
+        return
+    monkeypatch.setattr(_ch, "_elite_guard_outbound",
+                        lambda agent, api_kwargs: api_kwargs, raising=False)

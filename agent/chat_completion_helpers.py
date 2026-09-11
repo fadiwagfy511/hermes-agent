@@ -171,6 +171,83 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+class ExternalProjectionBlocked(Exception):
+    """Raised instead of sending a request that could not be made external-safe.
+
+    Defined here rather than imported from ``agent.external_projection`` so that
+    a missing or broken projection module degrades to a per-request refusal
+    instead of an ImportError that would prevent this module — and therefore the
+    whole agent, including local-only use — from starting at all.
+
+    ``status_code = 400`` makes Hermes' classifier treat it as a non-retryable
+    client error. 401/403 must not be used: those map to ``FailoverReason.auth``
+    and would send a locally-decided refusal into the credential-pool recovery
+    path, refreshing and then exhausting the user's credentials.
+    """
+
+    status_code = 400
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(
+            "blocked by Elite protected-project policy before leaving this machine "
+            f"(reason: {reason}). The request was NOT sent to any external provider. "
+            "Run this task on a local model, or remove the protected reference."
+        )
+
+
+def _elite_guard_outbound(agent, api_kwargs: dict) -> dict:
+    """Project and gate one outbound request before it can leave this machine.
+
+    Gated call sites: the two agent-loop choke points (``interruptible_api_call``
+    and ``interruptible_streaming_api_call``) and the iteration-limit summary
+    payloads in this module, which are sent directly rather than through them.
+
+    NOT gated: the auxiliary stack (context/trajectory compression, curator,
+    title generation, insights, goals/kanban helpers) builds and sends its own
+    requests, and ``auxiliary_client`` can resolve ``provider: auto`` to a real
+    provider endpoint using ambient credentials — egress that bypasses BOTH this
+    layer and the Elite gateway's DLP. That is pre-existing, predates this
+    module, and is reported separately; do not read this function as covering it.
+
+    External targets get an external-safe projection: framework contamination
+    (skills index entries, memory entries, skill bodies) is removed structurally,
+    then the fully serialized request is scanned. User content and non-framework
+    tool results are never rewritten — if they carry protected material the send
+    is refused. Local targets are returned untouched.
+
+    Failing to establish safety blocks the send. The Elite gateway runs its own
+    independent DLP scan afterwards; this is defense in depth, not a substitute.
+    """
+    provider = getattr(agent, "provider", None)
+    base_url = getattr(agent, "base_url", None)
+    try:
+        from agent import external_projection as _ep
+    except Exception:
+        # No projection layer: refuse anything that is not plainly local.
+        raise ExternalProjectionBlocked("projection_module_unavailable")
+
+    try:
+        decision = _ep.guard_outbound(
+            api_kwargs,
+            provider=provider,
+            base_url=base_url,
+            request_id=str(getattr(agent, "session_id", "") or "")[:12],
+        )
+    except ExternalProjectionBlocked:
+        raise
+    except Exception as exc:
+        # An unexpected failure inside the guard must never escape as an
+        # arbitrary error: that would leave the request neither sent nor
+        # refused, and the caller would classify it as a transport fault.
+        logger.warning("external projection failed closed: %s", type(exc).__name__)
+        raise ExternalProjectionBlocked("projection_error") from exc
+
+    if not decision["allowed"]:
+        raise ExternalProjectionBlocked(decision["reason"])
+    return decision["api_kwargs"]
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
@@ -185,6 +262,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    api_kwargs = _elite_guard_outbound(agent, api_kwargs)
+
     result = {"response": None, "error": None}
     request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
@@ -1595,6 +1674,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
+            # Iteration-limit summary payloads carry the full system prompt and
+            # every tool result, and are sent directly below rather than through
+            # the two choke points — so they are gated here explicitly.
+            codex_kwargs = _elite_guard_outbound(agent, codex_kwargs)
             codex_kwargs.pop("tools", None)
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
@@ -1605,6 +1688,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 "model": agent.model,
                 "messages": api_messages,
             }
+            # Iteration-limit summary payloads carry the full system prompt and
+            # every tool result, and are sent directly below rather than through
+            # the two choke points — so they are gated here explicitly.
+            summary_kwargs = _elite_guard_outbound(agent, summary_kwargs)
             if _summary_temperature is not None:
                 summary_kwargs["temperature"] = _summary_temperature
             if agent.max_tokens is not None:
@@ -1659,6 +1746,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
                                preserve_dots=agent._anthropic_preserve_dots())
+                # Iteration-limit summary payloads carry the full system prompt and
+                # every tool result, and are sent directly below rather than through
+                # the two choke points — so they are gated here explicitly.
+                _ant_kw = _elite_guard_outbound(agent, _ant_kw)
                 summary_response = agent._anthropic_messages_create(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
@@ -1678,6 +1769,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
+                # Iteration-limit summary payloads carry the full system prompt and
+                # every tool result, and are sent directly below rather than through
+                # the two choke points — so they are gated here explicitly.
+                codex_kwargs = _elite_guard_outbound(agent, codex_kwargs)
                 codex_kwargs.pop("tools", None)
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
@@ -1697,6 +1792,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     "model": agent.model,
                     "messages": api_messages,
                 }
+                # Iteration-limit summary payloads carry the full system prompt and
+                # every tool result, and are sent directly below rather than through
+                # the two choke points — so they are gated here explicitly.
+                summary_kwargs = _elite_guard_outbound(agent, summary_kwargs)
                 if _summary_temperature is not None:
                     summary_kwargs["temperature"] = _summary_temperature
                 if agent.max_tokens is not None:
@@ -1776,6 +1875,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    api_kwargs = _elite_guard_outbound(agent, api_kwargs)
+
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
