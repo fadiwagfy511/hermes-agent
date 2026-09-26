@@ -734,6 +734,12 @@ def build_anthropic_client(
 
     Returns an anthropic.Anthropic instance.
     """
+    # Elite policy (XP3D): refuse any destination other than the sanctioned
+    # gateway or an approved local route BEFORE a client exists. No base_url
+    # means the SDK default, api.anthropic.com — a direct public provider.
+    from agent import aux_egress_policy as _egress
+    _egress.assert_allowed(base_url or "https://api.anthropic.com",
+                           "main_agent.build_anthropic_client")
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(
@@ -845,6 +851,13 @@ def build_anthropic_bedrock_client(region: str):
 
     Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
     """
+    # Elite policy (XP3D): Bedrock is a direct public provider; refuse before
+    # any client or AWS credential lookup happens.
+    from agent import aux_egress_policy as _egress
+    if _egress.enabled():
+        raise _egress.AuxEgressBlocked(f"bedrock-runtime.{region}.amazonaws.com",
+                                       "main_agent.build_anthropic_bedrock_client",
+                                       "direct public provider")
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
         raise ImportError(

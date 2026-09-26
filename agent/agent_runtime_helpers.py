@@ -1563,6 +1563,15 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
+    # Elite policy (XP3D): the MAIN agent is held to the same allowlist as the
+    # auxiliary stack — the sanctioned gateway (:8082) or an approved local route.
+    # Enforced before any client exists, so a refused provider sends nothing.
+    from agent import aux_egress_policy as _egress
+    _where = f"main_agent.create_openai_client({reason})"
+    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://"):
+        if _egress.enabled():
+            raise _egress.AuxEgressBlocked("copilot-acp", _where, "direct public provider")
+    _egress.assert_allowed(client_kwargs.get("base_url"), _where)
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
