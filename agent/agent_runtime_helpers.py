@@ -1344,6 +1344,37 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 
 
+_SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie", "set-cookie"}
+_POLICY_BLOCK_TYPES = {"ExternalProjectionBlocked", "AuxEgressBlocked", "WebsitePolicyError", "CronPromptInjectionBlocked"}
+
+
+def _redact_dump_headers(headers: Dict[str, Any]) -> None:
+    """XP6E: case-insensitive redaction of credential-bearing headers before anything is persisted."""
+    for k in list(headers):
+        if str(k).lower() in _SENSITIVE_HEADERS:
+            headers[k] = "[REDACTED]"
+
+
+def _is_policy_block(error: Any, reason: Any) -> bool:
+    """True when the request was refused by a security/privacy policy (local hook or gateway DLP/protected deny)."""
+    if error is None:
+        return False
+    if type(error).__name__ in _POLICY_BLOCK_TYPES:
+        return True
+    msg = str(error).lower()
+    return any(s in msg for s in ("protected-project policy", "protected project", "blocked by elite", "dlp", "workspace policy", "egress refused", "refused by elite policy"))
+
+
+def _policy_reason(error: Any) -> str:
+    """Only the machine-readable reason code, e.g. 'protected_user_content' - never free text that could echo content."""
+    import re as _re
+    r = getattr(error, "reason", None)
+    if isinstance(r, str) and _re.fullmatch(r"[a-z_]{3,64}", r):
+        return r
+    m = _re.search(r"reason:\s*([a-z_]{3,64})", str(error))
+    return m.group(1) if m else type(error).__name__
+
+
 def dump_api_request_debug(
     agent,
     api_kwargs: Dict[str, Any],
@@ -1377,12 +1408,14 @@ def dump_api_request_debug(
                 "method": "POST",
                 "url": f"{agent.base_url.rstrip('/')}{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}",
                 "headers": {
-                    "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
+                    # XP6E: never persist any part of a credential (was an 8+4-char mask).
+                    "Authorization": "[REDACTED]",
                     "Content-Type": "application/json",
                 },
                 "body": body,
             },
         }
+        _redact_dump_headers(dump_payload["request"]["headers"])
 
         if error is not None:
             error_info: Dict[str, Any] = {
@@ -1407,6 +1440,30 @@ def dump_api_request_debug(
                     _ra().logger.debug("Could not extract error response details: %s", e)
 
             dump_payload["error"] = error_info
+
+        if _is_policy_block(error, reason):
+            # XP6F: the refused current-turn contents must not stay in state.db either (rows + later inserts).
+            try:
+                from agent import persist_scrub as _ps
+                _raw = _ps.mark_blocked(agent.session_id, _ps.current_turn_contents(body.get("messages") or []))
+                _db = getattr(agent, "_session_db", None)
+                if _db is not None and _raw:
+                    _db.redact_blocked_contents(agent.session_id, _raw)
+            except Exception as _e:
+                _ra().logger.debug("XP6F blocked-content purge failed: %s", _e)
+            # XP6E: a request blocked by a protected-project / workspace / DLP / egress policy must not have its
+            # payload persisted. Keep only safe audit metadata (no messages, tools, prompt text or error bodies).
+            dump_payload["decision"] = "blocked"
+            dump_payload["request"]["body"] = {
+                "model": body.get("model"),
+                "message_count": len(body.get("messages") or body.get("input") or []),
+                "tool_count": len(body.get("tools") or []),
+                "payload": "[NOT PERSISTED: blocked by policy]",
+            }
+            if isinstance(dump_payload.get("error"), dict):
+                e = dump_payload["error"]
+                dump_payload["error"] = {k: e[k] for k in ("type", "status_code", "code") if k in e}
+                dump_payload["error"]["policy_reason"] = _policy_reason(error)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         # Sanitize the session ID into a traversal-free path segment — it can

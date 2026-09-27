@@ -3092,6 +3092,20 @@ class SessionDB:
                 return content
         return content
 
+    def redact_blocked_contents(self, session_id: str, contents: List[str]) -> int:
+        """XP6F: replace already-persisted policy-blocked contents of *session_id* with a denial placeholder."""
+        from agent import persist_scrub as _ps
+        forms = sorted({c for raw in contents for c in (raw, _ps.scrub_text(raw)) if isinstance(c, str) and c})
+        if not forms:
+            return 0
+        def _do(conn):
+            n = 0
+            for c in forms:
+                n += conn.execute("UPDATE messages SET content = ? WHERE session_id = ? AND content = ?",
+                                  (_ps.BLOCKED_PLACEHOLDER, session_id, c)).rowcount
+            return n
+        return self._execute_write(_do)
+
     def append_message(
         self,
         session_id: str,
@@ -3140,6 +3154,13 @@ class SessionDB:
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
+        # XP6F: secrets and policy-blocked payloads are removed BEFORE sqlite storage (FTS is fed from this row).
+        from agent import persist_scrub as _ps
+        stored_content = (_ps.BLOCKED_PLACEHOLDER if _ps.is_blocked(session_id, stored_content)
+                          else _ps.scrub_text(stored_content))
+        tool_calls_json = _ps.scrub_text(tool_calls_json)
+        reasoning = _ps.scrub_text(reasoning)
+        reasoning_content = _ps.scrub_text(reasoning_content)
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -3242,6 +3263,11 @@ class SessionDB:
                 json.dumps(codex_message_items) if codex_message_items else None
             )
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+            # XP6F: scrub before sqlite storage (bulk replace/compact path)
+            from agent import persist_scrub as _ps
+            _enc = self._encode_content(msg.get("content"))
+            _enc = _ps.BLOCKED_PLACEHOLDER if _ps.is_blocked(session_id, _enc) else _ps.scrub_text(_enc)
+            tool_calls_json = _ps.scrub_text(tool_calls_json)
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -3257,15 +3283,15 @@ class SessionDB:
                 (
                     session_id,
                     role,
-                    self._encode_content(msg.get("content")),
+                    _enc,
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     msg.get("tool_name"),
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
-                    msg.get("reasoning") if role == "assistant" else None,
-                    msg.get("reasoning_content") if role == "assistant" else None,
+                    _ps.scrub_text(msg.get("reasoning")) if role == "assistant" else None,
+                    _ps.scrub_text(msg.get("reasoning_content")) if role == "assistant" else None,
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
